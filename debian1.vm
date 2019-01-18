@@ -1,0 +1,17 @@
+
+locale en_US
+
+network nat_ecn
+network packstack_bgci
+
+disk debian1.img
+
+console serial
+
+hostname test1
+
+biosdevname 0
+
+memory 2G
+
+cpus 1

@@ -1,0 +1,21 @@
+#!/bin/bash
+
+image_size=2
+image_format=qcow2
+
+ubuntu_url=http://se.archive.ubuntu.com/ubuntu
+ubuntu_release=bionic
+
+debootstrap_include=ssh
+hostname=test1
+
+locales=en_US.UTF-8
+
+network ens3 dhcp
+
+keyboard pc105 se
+
+ntp 193.180.251.38 193.180.251.39
+
+useradd -m -p '$1$ZHfsFWzb$Le8OieS9/wk6s/hO0JmNX.' -s /bin/bash denali
+gpasswd -a denali sudo

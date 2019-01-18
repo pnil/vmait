@@ -1,0 +1,19 @@
+#!/bin/bash
+
+image_size=2
+image_format=qcow2
+
+repo_url=http://deb.debian.org/debian/
+repo_release=stable
+
+debootstrap_include=ssh
+hostname=debian1
+
+locales=en_US.UTF-8
+
+network ens3 dhcp
+
+keyboard pc105 se
+
+useradd -m -p '$1$ZHfsFWzb$Le8OieS9/wk6s/hO0JmNX.' -s /bin/bash denali
+gpasswd -a denali sudo
