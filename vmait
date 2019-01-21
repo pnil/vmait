@@ -66,6 +66,27 @@ def_image_functions()
 	    echo >> $CHROOT_SCRIPT "END"
 	fi
     }
+
+    console()
+    {
+	if [ "$SETUP_PHASE" == "chroot" ]; then
+	    if [ "$1" == "serial" ]; then
+		echo >> $CHROOT_SCRIPT -e "\n# console $*"
+		echo >> $CHROOT_SCRIPT "systemctl enable serial-getty@ttyS0"
+		echo >> $CHROOT_SCRIPT "sed -i 's/GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 console=tty0 console=ttyS0,115200n8\"/g'" /etc/default/grub
+	    fi
+	fi
+    }
+
+    biosdevname()
+    {
+	if [ "$SETUP_PHASE" == "chroot" ]; then
+	    if [ "$1" == "0" ]; then
+		echo >> $CHROOT_SCRIPT -e "\n# biosdevname $*"
+		echo >> $CHROOT_SCRIPT "sed -i 's/GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 net.ifnames=0 biosdevname=0\"/g'" /etc/default/grub
+	    fi
+	fi
+    }
 }
 
 def_vm_functions()
@@ -358,11 +379,8 @@ do_image_create()
     fi
 
     LANG=C sudo chroot $mnt /bin/bash << EOF
-echo >> /etc/fstab "/dev/${disk_dev_name}1 / ext2 errors=remount-ro 0 1"
+echo > /etc/fstab "/dev/${disk_dev_name}1 / ext2 errors=remount-ro 0 1"
 sed -i 's,GRUB_CMDLINE_LINUX_DEFAULT=.*,GRUB_CMDLINE_LINUX_DEFAULT="quiet",g' /etc/default/grub
-grub-install $dev --modules=part_msdos
-update-grub
-sed -i "s,$part,/dev/${disk_dev_name}1,g" /boot/grub/grub.cfg
 echo > /etc/hostname $hostname
 cat > /etc/hosts << END
 127.0.0.1       localhost
@@ -394,6 +412,10 @@ if [ ! -f /etc/default/keyboard ]; then
     dpkg-reconfigure keyboard-configuration -f noninteractive
     setupcon --save
 fi
+
+grub-install $dev --modules=part_msdos
+update-grub
+sed -i "s,$part,/dev/${disk_dev_name}1,g" /boot/grub/grub.cfg
 
 /bin/sh -x /tmp/post_install.sh
 
@@ -543,12 +565,14 @@ do_vm()
     fi
 }
 
-if [ "$1" == "image" ]; then
-    shift 1
-    do_image "$@"
-elif [ "$1" == "vm" ]; then
-    shift 1
-    do_vm "$@"
-else
-    usage
-fi
+cmd=$1
+shift 1
+
+case $cmd in
+    image|vm)
+	do_$cmd "$@"
+	;;
+    *)
+	usage
+	;;
+esac

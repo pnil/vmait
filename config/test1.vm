@@ -6,11 +6,7 @@ network packstack_bgci
 
 disk test1.img
 
-console serial
-
 hostname test1
-
-biosdevname 0
 
 memory 2G
 

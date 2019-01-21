@@ -11,9 +11,13 @@ hostname=test1
 
 locales=en_US.UTF-8
 
-network ens3 dhcp
+network eth0 dhcp
 
 keyboard pc105 se
+
+console serial
+
+biosdevname 0
 
 useradd -m -p '$1$ZHfsFWzb$Le8OieS9/wk6s/hO0JmNX.' -s /bin/bash denali
 gpasswd -a denali sudo
