@@ -1,152 +1,572 @@
 #!/bin/bash
 
-def_image_functions()
+def_image_size=1
+def_image_format=qcow2
+def_repo_url=http://archive.ubuntu.com/ubuntu
+def_repo_release=xenial
+def_hostname=debootstrap
+def_arch=amd64
+def_disk_dev_name=vda
+
+shopt -s extglob
+
+which_cmd()
 {
-    escargs()
-    {
-	printf "%q " "$@"
-    }
-
-    useradd()
-    {
-	if [ "$SETUP_PHASE" == "chroot" ]; then
-	    echo >> $CHROOT_SCRIPT -e "\n# useradd $*"
-	    echo >> $CHROOT_SCRIPT useradd $(escargs "$@")
-	fi
-    }
-
-    network()
-    {
-	if [ "$SETUP_PHASE" == "chroot" ]; then
-	    echo >> $CHROOT_SCRIPT -e "\n# network $*"
-	    echo >> $CHROOT_SCRIPT 'cat >> /etc/network/interfaces << END'
-	    echo >> $CHROOT_SCRIPT -e "\nauto $1"
-	    echo >> $CHROOT_SCRIPT "iface $1 inet $2"
-	    echo >> $CHROOT_SCRIPT "END"
-	fi
-    }
-
-    timezone()
-    {
-	if [ "$SETUP_PHASE" == "chroot" ]; then
-	    echo >> $CHROOT_SCRIPT "ln -sf /usr/share/zoneinfo/$1 /etc/localtime"
-	fi
-    }
-
-    keyboard()
-    {
-	if [ "$SETUP_PHASE" == "chroot" ]; then
-	    echo >> $CHROOT_SCRIPT -e "\n# keyboard $*"
-	    echo >> $CHROOT_SCRIPT 'debconf-set-selections << END'
-	    echo >> $CHROOT_SCRIPT "keyboard-configuration keyboard-configuration/modelcode select $1"
-	    echo >> $CHROOT_SCRIPT "keyboard-configuration keyboard-configuration/layoutcode select $2"
-	    echo >> $CHROOT_SCRIPT "keyboard-configuration keyboard-configuration/variantcode select $3"
-	    echo >> $CHROOT_SCRIPT "keyboard-configuration keyboard-configuration/optionscode select $4"
-	    echo >> $CHROOT_SCRIPT "END"
-	    echo >> $CHROOT_SCRIPT "rm -f /etc/default/keyboard"
-	fi
-    }
-
-    gpasswd()
-    {
-	if [ "$SETUP_PHASE" == "chroot" ]; then
-	    echo >> $CHROOT_SCRIPT -e "\n# gpasswd $*"
-	    echo >> $CHROOT_SCRIPT gpasswd $(escargs "$@")
-	fi
-    }
-
-    ntp()
-    {
-	if [ "$SETUP_PHASE" == "chroot" ]; then
-	    echo >> $CHROOT_SCRIPT -e "\n# ntp $*"
-	    echo >> $CHROOT_SCRIPT "mkdir -p /etc/systemd/timesyncd.conf.d"
-	    echo >> $CHROOT_SCRIPT 'cat >> /etc/systemd/timesyncd.conf.d/01-default.conf << END'
-	    echo >> $CHROOT_SCRIPT '[Time]'
-	    echo >> $CHROOT_SCRIPT "NTP=$*"
-	    echo >> $CHROOT_SCRIPT "END"
-	fi
-    }
-
-    console()
-    {
-	if [ "$SETUP_PHASE" == "chroot" ]; then
-	    if [ "$1" == "serial" ]; then
-		echo >> $CHROOT_SCRIPT -e "\n# console $*"
-		echo >> $CHROOT_SCRIPT "systemctl enable serial-getty@ttyS0"
-		echo >> $CHROOT_SCRIPT "sed -i 's/GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 console=tty0 console=ttyS0,115200n8\"/g'" /etc/default/grub
-	    fi
-	fi
-    }
-
-    biosdevname()
-    {
-	if [ "$SETUP_PHASE" == "chroot" ]; then
-	    if [ "$1" == "0" ]; then
-		echo >> $CHROOT_SCRIPT -e "\n# biosdevname $*"
-		echo >> $CHROOT_SCRIPT "sed -i 's/GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 net.ifnames=0 biosdevname=0\"/g'" /etc/default/grub
-	    fi
-	fi
-    }
+    which $1 >/dev/null && return
+    echo "Needed command not installed: $1"
+    exit 1
 }
 
-def_vm_functions()
+check_dependencies()
 {
-    disk()
-    {
-	if [ -f "$1" ]; then
-	    bus=${2:-virtio}
-	    vm_disks="$vm_disks --disk path=$1,bus=$bus"
-	else
-	    echo "Image not found: $1"
-	    exit
-	fi
-    }
+    case $1 in
+	image)
+	    which_cmd debootstrap
+	    which_cmd qemu-img
+	    which_cmd qemu-nbd
+	    which_cmd zerofree
+	    ;;
+	vm)
+	    which_cmd virsh
+	    which_cmd virt-install
+	    ;;
+    esac
+}
 
-    network()
-    {
-	if virsh net-info $1 >/dev/null 2>&1; then
-	    vm_networks="$vm_networks --network=network:$1"
-	    [ -n "$2" ] && vm_dhcp="$vm_dhcp $1:$2"
-	else
-	    echo "Network not found: $1"
-	    exit
-	fi
-    }
+gen_fstab()
+{
+    [ -n "$cfg_disk_dev_name" ] || return
+    cat >> $1 <<EOF
 
-    console()
-    {
-	vm_console=$1
-    }
+echo > /etc/fstab "/dev/${cfg_disk_dev_name}1 / ext2 errors=remount-ro 0 1"
+sed -i 's,GRUB_CMDLINE_LINUX_DEFAULT=.*,GRUB_CMDLINE_LINUX_DEFAULT="quiet",g' /etc/default/grub
+EOF
+}
 
-    memory()
-    {
-	case $1 in
-	    *G) vm_mem=$(( ${1%*G} * 1024 )) ;;
-	    *) vm_mem=$1 ;;
+gen_hostname()
+{
+    [ -n "$cfg_hostname" ] || return
+    cat >> $1 <<EOF
+
+echo > /etc/hostname $cfg_hostname
+cat > /etc/hosts << END
+127.0.0.1       localhost
+127.0.1.1       $cfg_hostname
+END
+EOF
+}
+
+gen_timezone()
+{
+    local zone out=$1
+
+    [ -n "$cfg_timezone" ] || return
+
+    if [ -n "$cfg_timezone" ]; then
+	read -r -a zone <<< "$cfg_timezone"
+	cat >> $1 <<EOF
+
+# timezone $cfg_timezone
+rm -f /etc/localtime /etc/timezone
+debconf-set-selections << END
+tzdata tzdata/Areas select ${zone[0]}
+tzdata tzdata/Zones/${zone[0]} select ${zone[1]}
+END
+dpkg-reconfigure tzdata -f noninteractive
+EOF
+    fi
+}
+
+gen_network()
+{
+    [ ${#cfg_networks[@]} -gt 0 ] || return
+
+    cat >> $1 <<EOF
+
+# Network
+cat > /etc/network/interfaces << END
+source /etc/network/interfaces.d/*
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+END
+EOF
+
+    echo "${cfg_networks[@]}"
+
+    for n in "${cfg_networks[@]}"
+    do
+	read -r -a t <<< "$n"
+	cat >> $out <<EOF
+
+# network $n
+cat >> /etc/network/interfaces << END
+
+auto ${t[0]}
+iface ${t[0]} inet ${t[1]}
+END
+EOF
+    done
+}
+
+gen_locales()
+{
+    [ -n "$cfg_locales" ] || return
+    cat >> $1 <<EOF
+
+# locales $cfg_locales
+for lc in $cfg_locales
+do
+    sed -i "s,# \$lc ,\$lc ," /etc/locale.gen
+done
+locale-gen
+EOF
+}
+
+gen_keyboard()
+{
+    [ -n "$cfg_keyboard" ] || return
+    read -r -a t <<< "$cfg_keyboard"
+    cat >> $1 <<EOF
+
+# keyboard $cfg_keyboard
+debconf-set-selections << END
+keyboard-configuration keyboard-configuration/modelcode select ${t[0]}
+keyboard-configuration keyboard-configuration/layoutcode select ${t[1]}
+keyboard-configuration keyboard-configuration/variantcode select ${t[2]}
+keyboard-configuration keyboard-configuration/optionscode select ${t[3]}
+END
+rm -f /etc/default/keyboard
+dpkg-reconfigure keyboard-configuration -f noninteractive
+setupcon --save
+EOF
+}
+
+gen_ntp()
+{
+    [ -n "$cfg_ntp" ] || return
+    cat >> $1 <<EOF
+
+# ntp $cfg_ntp
+mkdir -p /etc/systemd/timesyncd.conf.d
+cat > /etc/systemd/timesyncd.conf.d/01-default.conf << END
+[Time]
+NTP=$cfg_ntp
+END
+EOF
+}
+
+gen_users()
+{
+    if [ ${#cfg_users[@]} -ne 0 ]; then
+	echo -e >>$1 "\n# useradd"
+	for u in "${cfg_users[@]}"
+	do
+	    echo >> $1 "useradd" "$u"
+	done
+    fi
+
+    if [ ${#cfg_gpasswd[@]} -ne 0 ]; then
+	echo -e >>$1 "\n# gpasswd"
+	for u in "${cfg_gpasswd[@]}"
+	do
+	    echo >> $out "gpasswd" "$u"
+	done
+    fi
+}
+
+gen_console()
+{
+    if [ "$cfg_console" == "serial" ]; then
+	cat >> $1 <<EOF
+
+# console $cfg_console
+systemctl enable serial-getty@ttyS0
+sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 console=tty0 console=ttyS0,115200n8"/g' /etc/default/grub
+EOF
+    fi
+}
+
+gen_biosdevname()
+{
+    if [ "$cfg_biosdevname" == "0" ]; then
+	cat >> $1 <<EOF
+
+# biosdevname $cfg_bisdevname
+sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 net.ifnames=0 biosdevname=0"/g' /etc/default/grub
+EOF
+    fi
+}
+
+gen_chroot_script()
+{
+    local out=$1
+    shift 1
+
+    echo > $out '#!/bin/bash'
+
+    gen_fstab $out
+    gen_hostname $out
+    gen_timezone $out
+    gen_network $out
+    gen_locales $out
+    gen_keyboard $out
+    gen_ntp $out
+    gen_users $out
+    gen_console $out
+    gen_biosdevname $out
+}
+
+img_hostname()
+{
+    if ! [[ $1 =~ ^[-a-z0-9]*$ ]]; then
+	echo "$lineno: Invalid host name: $1"
+	echo "$lineno: Valid characters are: - a-z 0-9"
+	exit 1
+    fi
+
+    if [[ $1 =~ ^-.*$ ]]; then
+	echo "$lineno: Hostname must not start with hyphen"
+	exit 1
+    fi
+
+    cfg_hostname=$1
+}
+
+img_image_size()
+{
+    case $1 in
+	''|*[!0-9]*)
+	    echo "$lineno: Invalid image size: $1"
+	    exit 1
+	    ;;
+	*)
+	    cfg_image_size=$1
+	    ;;
+    esac
+}
+
+img_image_format()
+{
+    case $1 in
+	qcow|qcow2|raw)
+	    cfg_image_format=$1
+	    ;;
+	*)
+	    echo "$lineno: Invalid image format: $1"
+	    exit 1
+	    ;;
+    esac
+}
+
+img_repo_url()
+{
+    cfg_repo_url=$1
+}
+
+img_repo_release()
+{
+    cfg_repo_release=$1
+}
+
+img_include()
+{
+    cfg_include="$cfg_include $*"
+}
+
+img_locales()
+{
+    cfg_locales="$cfg_locales $*"
+}
+
+img_network()
+{
+    cfg_networks+=("$*")
+    #echo ${cfg_networks[@]}
+}
+
+img_keyboard()
+{
+    cfg_keyboard="$@"
+}
+
+img_console()
+{
+    cfg_console="$@"
+}
+
+img_biosdevname()
+{
+    cfg_biosdevname="$@"
+}
+
+img_useradd()
+{
+    cfg_users+=("$*")
+}
+
+img_gpasswd()
+{
+    cfg_gpasswd+=("$*")
+}
+
+img_ntp()
+{
+    cfg_ntp=$1
+}
+
+img_timezone()
+{
+    case $1 in
+	*/*) cfg_timezone="${1%/*} ${1#*/}" ;;
+	*)
+	    if [[ $# -eq 2 ]]; then
+		cfg_timezone="$1 $2"
+	    else
+		echo "Invalid timezone: $*"
+		exit 1
+	    fi
+    esac
+}
+
+parse_args()
+{
+    local prefix=$1 pattern=$2
+    shift 2
+    for a in "$@"
+    do
+	key=${a%=*}
+	val=${a#*=}
+	echo $key $val
+	case $key in
+	    $pattern)
+		${prefix}_$key $val
+		;;
+	    *)
+		echo "Invalid argument: $a"
+		exit 1
+		;;
 	esac
-    }
-
-    biosdevname()
-    {
-	vm_biosdevname=$1
-    }
-
-    locale()
-    {
-	vm_locale=$1
-    }
-
-    hostname()
-    {
-	vm_hostname=$1
-    }
-
-    cpus()
-    {
-	vm_cpus=$1
-    }
+    done
 }
 
+parse_img_args()
+{
+    parse_args img '@(hostname|image_size|image_format|repo_url|repo_release)' "$@"
+}
+
+vm_disk()
+{
+    if [ -f "$1" ]; then
+	bus=${2:-virtio}
+	#vm_disks="$vm_disks --disk path=$1,bus=$bus"
+	vm_disks="--disk path=$1,bus=$bus"
+    elif [ "$1" == "none" ]; then
+	vm_disks="--disk none"
+    else
+	echo "Image not found: $1"
+	exit 1
+    fi
+}
+
+vm_network()
+{
+    if virsh net-info $1 >/dev/null 2>&1; then
+	#vm_networks="$vm_networks --network=network:$1"
+	vm_networks="$vm_networks $1"
+	[ -n "$2" ] && vm_dhcp="$vm_dhcp $1:$2"
+    else
+	echo "Network not found: $1"
+	exit 1
+    fi
+}
+
+vm_dhcp()
+{
+    local net ip
+
+    case $1 in
+	*:*)
+	    net=${1%:*}
+	    ip=${1#*:}
+    esac
+
+    if ! virsh net-info $net >/dev/null 2>&1; then
+	echo "Network not found: $net"
+	exit 1
+    fi
+
+    if ! [[ $ip =~ ^[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*$ ]] ; then
+	echo "Invalid IP address: $ip"
+	exit 1
+    fi
+
+    vm_dhcp=$(echo " $vm_dhcp " | sed "s/$net:[^ ]*//g")
+    vm_dhcp="$vm_dhcp $net:$ip"
+}
+
+vm_console()
+{
+    vm_console=$1
+}
+
+vm_memory()
+{
+    case $1 in
+	*G) vm_mem=$(( ${1%*G} * 1024 )) ;;
+	*) vm_mem=$1 ;;
+    esac
+}
+
+vm_biosdevname()
+{
+    vm_biosdevname=$1
+}
+
+vm_locale()
+{
+    vm_locale="$1"
+}
+
+vm_hostname()
+{
+    vm_hostname=$1
+}
+
+vm_os_variant()
+{
+    vm_os_variant=$1
+}
+
+vm_cpus()
+{
+    vm_cpus=$1
+}
+
+vm_mac()
+{
+    case $1 in
+	*:*:*:*:*:*) cfg_mac="$cfg_mac,$1" ;;
+	*)
+	    echo "Invalid MAC: $1"
+	    exit 1
+    esac
+}
+
+parse_vm_args()
+{
+    parse_args vm '@(hostname|os_variant|memory|disk|network|locale|cpus|dhcp|mac)' "$@"
+}
+
+run_cmd()
+{
+    local prefix=$1
+    local cmd=$2
+    shift 2
+    local args=("$@")
+
+    #echo ${args[@]}
+    if declare -F ${prefix}_$cmd > /dev/null; then
+	${prefix}_$cmd "${args[@]}"
+    else
+	echo "$lineno: Unknown command: $cmd"
+	exit 1
+    fi
+}
+
+read_conf()
+{
+    local tmp ln file="$1" prefix=$2
+
+    if [ ! -f "$file" ]; then
+	echo "File not found: $file"
+	exit 1
+    fi
+
+    tmp=$(mktemp)
+    sed 's/#.*//g' > $tmp $file
+
+    lineno=1
+
+    while read -a ln
+    do
+	if [[ -n "${ln[0]}" ]]; then
+
+	    if [ "${ln[0]}" == "%post" ]; then
+		readarray -t cfg_post
+		break
+	    fi
+
+	    if ! [[ ${ln[0]} =~ ^[a-zA-Z0-9_]*$ ]]; then
+		echo "$lineno: Invalid syntax: ${ln[@]}"
+		rm -f $tmp
+		exit 1
+	    fi
+
+	    run_cmd $prefix "${ln[@]}"
+	fi
+	lineno=$(( $lineno + 1 ))
+    done < "$tmp"
+    rm -f $tmp
+}
+
+read_img_conf()
+{
+    cfg_image_size=$def_image_size
+    cfg_image_format=$def_image_format
+    cfg_repo_url=$def_repo_url
+    cfg_repo_release=$def_repo_release
+    cfg_arch=$def_arch
+    cfg_disk_dev_name=$def_disk_dev_name
+    cfg_include=
+    cfg_hostname=$def_hostname
+    cfg_locales=
+    cfg_users=()
+    cfg_gpasswd=()
+    cfg_networks=()
+    cfg_timezone=
+    cfg_keyboard=
+    cfg_ntp=
+    cfg_console=
+    cfg_biosdevname=
+    cfg_post=()
+
+    read_conf $1 img
+}
+
+read_vm_conf()
+{
+    vm_name=$1
+    vm_networks=
+    vm_disks=
+    vm_console=
+    vm_biosdevname=1
+    vm_hostname=
+    vm_os_variant=
+    vm_locale=
+    vm_cpus=$def_cpus
+    vm_mem=$def_mem
+    vm_dhcp=
+    cfg_mac=
+
+    read_conf $2 vm
+}
+
+show_vm_params()
+{
+    echo "Name: $vm_name"
+    echo "Networks: $vm_networks"
+    echo "Disks: $vm_disks"
+    echo "Console: $vm_console"
+    echo "BIOS dev name: $vm_biosdevname"
+    echo "Hostname: $vm_hostname"
+    echo "OS Variant: $vm_os_variant"
+    echo "Locale: $vm_locale"
+    echo "Cpus: $vm_cpus"
+    echo "RAM: $vm_mem"
+    echo "DHCP: $vm_dhcp"
+}
 
 safe_umount()
 {
@@ -155,9 +575,13 @@ safe_umount()
 
 clean_exit()
 {
+    local rv=$?
     umount_chroot $mnt
     detach_image $dev $dev_cmd
-    exit
+    if [ -f "$tmp_image" ]; then
+	rm "$tmp_image"
+    fi
+    exit $rv
 }
 
 usage()
@@ -171,6 +595,8 @@ usage()
 
 do_image()
 {
+    check_dependencies image
+
     if [ "$1" == "create" ]; then
 	[[ $# -ge 3 ]] || usage
 	image=$2
@@ -184,13 +610,18 @@ do_image()
 	esac		    
 	if [ ! -f $setup_script ]; then
 	    echo "Setup script do not exist: $setup_script"
-	    exit
+	    exit 1
 	fi
-	do_image_create
+	shift 3
+	do_image_create "$@"
     elif [ "$1" == "visit" ]; then
 	[[ $# -ge 2 ]] || usage
-	image=$2
-	do_image_visit
+	shift 1
+	do_image_visit "$@"
+    elif [ "$1" == "modify" ]; then
+	[[ $# -ge 2 ]] || usage
+	shift 1
+	do_image_modify "$@"
     elif [ "$1" == "copy" ]; then
 	[[ $# -ge 3 ]] || usage
 	do_image_copy $2 $3
@@ -204,16 +635,20 @@ mount_chroot()
     sudo mount -t proc none $1/proc
     sudo mount -t sysfs none $1/sys
     sudo mount -t devpts none $1/dev/pts
+    mkdir -p $1/tmp/import
+    sudo mount -t tmpfs -o size=512M tmpfs $1/tmp/import
 }
 
 umount_chroot()
 {
-    if [ -n "$1" ]; then
+    if [ -n "$1" -a -d "$1" ]; then
+	safe_umount $1/tmp/import
 	safe_umount $1/dev/pts
 	safe_umount $1/sys
 	safe_umount $1/proc
 	safe_umount $1/dev
 	safe_umount $1
+        sudo rmdir $1
     fi
 
     if [ -n "$3" ]; then
@@ -229,10 +664,17 @@ attach_image()
 	    export dev_cmd=losetup
 	    ;;
 	qcow*)
-	    export dev=/dev/nbd0
 	    sudo modprobe nbd max_part=16
-	    sudo qemu-nbd -c $dev $2 || exit
-	    export dev_cmd=qemu-nbd
+	    for d in /sys/class/block/nbd? /sys/class/block/nbd??; do
+		if [ "$(cat $d/size)" == "0" ]; then
+		    export dev=/dev/$(basename $d)
+		    sudo qemu-nbd -c $dev $2 || exit
+		    export dev_cmd=qemu-nbd
+		    return
+		fi
+	    done
+	    echo "No free NBD device"
+	    exit 1
 	    ;;
     esac
 }
@@ -248,6 +690,7 @@ zerofree_image()
 {
     local dev=$1
     if which zerofree >/dev/null; then
+	echo "Marking unused space as free"
 	sudo zerofree -v $dev
     else
 	echo "Could not compact image, zerofree not installed"
@@ -258,7 +701,7 @@ compact_image()
 {
     local src=$1 dst=$2
     check_image_exist "$dst"
-    qemu-img convert -O $image_format $src $dst || exit
+    qemu-img convert -O $cfg_image_format $src $dst || exit
     ls -l $src $dst
 }
 
@@ -272,80 +715,59 @@ check_image_exist()
 {
     if [ -f "$1" ]; then
 	echo "Image exist: $1"
-	exit
+	exit 1
     fi
 }
 
 do_image_create()
 {
     check_image_exist "$image"
-    export image_size=1
-    export image_format=qcow2
-    export repo_url=http://archive.ubuntu.com/ubuntu
-    export repo_release=xenial
-    export debootstrap_include=
-    export hostname=debootstrap
-    export locales=
-    export arch=amd64
-    export disk_dev_name=vda
-    export import_path=""
-    export post_install=""
-
-    def_image_functions
-
-    SETUP_PHASE=init
-    . $setup_script
-
-    if ! [[ $hostname =~ ^[-a-z0-9]*$ ]]; then
-	echo "Invalid host name: $hostname"
-	echo "Valid characters are: - a-z 0-9"
-	exit 1
-    fi
-    if [[ $hostname =~ ^-.*$ ]]; then
-	echo "Hostname must not start with hyphen"
-	exit 1
-    fi
-    
-    SETUP_PHASE=chroot
+    read_img_conf $setup_script
+    parse_img_args "$@"
     CHROOT_SCRIPT=$(mktemp)
-    . $setup_script
+    gen_chroot_script $CHROOT_SCRIPT
     #cat $CHROOT_SCRIPT
+    #rm $CHROOT_SCRIPT
+    #for t in "${cfg_post[@]}"
+    #do
+    #    echo "$t"
+    #done
     #exit
 
-    case $repo_url in
+    case $cfg_repo_url in
 	*ubuntu*)
 	    include=linux-image-generic,grub-pc
 	    ;;
 	*debian*)
-	    include=linux-image-$arch,locales,sudo,keyboard-configuration,console-setup,net-tools,grub-pc
+	    include=linux-image-$cfg_arch,locales,sudo,keyboard-configuration,console-setup,net-tools,grub-pc
 	    ;;
 	*)
-	    echo "Cant guess distro from URL: $repo_url"
-	    exit
+	    echo "Cant guess distro from URL: $cfg_repo_url"
+	    exit 1
 	    ;;
     esac
-	
-    if [ -n "$debootstrap_include" ]; then
-	include=$include,$(echo $debootstrap_include | sed "s/  */,/g")
+
+    if [ -n "$cfg_include" ]; then
+	include=$include,$(echo $cfg_include | sed "s/  */,/g")
     fi
 
     tmp_image=${image}.tmp
 
     if [ -f "$tmp_image" ]; then
 	echo "Temporary image file exists: $tmp_image"
-	exit
+	exit 1
     fi
 
-    case $image_format in
+    case $cfg_image_format in
 	raw)
-	    dd if=/dev/zero of=$tmp_image bs=1024 count=1 seek=$(( $image_size * 1024 * 1024 - 1))
+	    dd if=/dev/zero of=$tmp_image bs=1024 count=1 seek=$(( $cfg_image_size * 1024 * 1024 - 1))
 	    ;;
 	qcow*)
-	    qemu-img create -f $image_format $tmp_image ${image_size}G
+	    qemu-img create -f $cfg_image_format $tmp_image ${cfg_image_size}G
 	    ;;
     esac
 
-    attach_image $image_format $tmp_image
+    attach_image $cfg_image_format $tmp_image
 
     part=${dev}p1
 
@@ -356,68 +778,45 @@ do_image_create()
     mnt=$(sudo mktemp -d)
     mount_image $dev p1 $mnt
 
-    sudo debootstrap --include=$include --arch=$arch $repo_release $mnt $repo_url || clean_exit
-    cat $mnt/debootstrap/debootstrap.log
-    cp $CHROOT_SCRIPT $mnt/tmp/setup_chroot.sh
-    rm $CHROOT_SCRIPT
-    #sudo mkdir -p $mnt/tmp
-    #sudo chmod 777 $mnt/tmp
-    echo "$post_install" > $mnt/tmp/post_install.sh
-    #type post_install | sed '1,1d' >> $mnt/tmp/post_install.sh
-    #echo >> $mnt/tmp/post_install.sh post_install
+    sudo debootstrap --include=$include --arch=$cfg_arch $cfg_repo_release $mnt $cfg_repo_url || clean_exit
+    #cat $mnt/var/log/bootstrap.log
 
     mount_chroot $mnt
 
-    import_dir=
-    if [ -n "$import_path" ]; then
-	import_dir=$(mktemp -d)
-	mkdir $mnt/tmp/import
-	for p in "$import_path"; do
-	    cp -r $p $import_dir
+    
+    cp $CHROOT_SCRIPT $mnt/tmp/import/setup_chroot.sh
+    rm $CHROOT_SCRIPT
+    #sudo mkdir -p $mnt/tmp
+    #sudo chmod 777 $mnt/tmp
+    echo > $mnt/tmp/import/post_install.sh "#!/bin/bash"
+    for t in "${cfg_post[@]}"
+    do
+	echo >> $mnt/tmp/import/post_install.sh "$t"
+    done
+    
+    #type post_install | sed '1,1d' >> $mnt/tmp/post_install.sh
+    #echo >> $mnt/tmp/post_install.sh post_install
+
+    if [ -n "$cfg_import_path" ]; then
+	for p in "$cfg_import_path"; do
+	    cp -r $p $mnt/tmp/import
 	done
-	sudo mount -o bind $import_dir $mnt/tmp/import
     fi
 
+    sudo cp $mnt/var/log/bootstrap.log $mnt
+    sudo cp $mnt/tmp/import/setup_chroot.sh $mnt
+    sudo cp $mnt/tmp/import/post_install.sh $mnt
+
     LANG=C sudo chroot $mnt /bin/bash << EOF
-echo > /etc/fstab "/dev/${disk_dev_name}1 / ext2 errors=remount-ro 0 1"
-sed -i 's,GRUB_CMDLINE_LINUX_DEFAULT=.*,GRUB_CMDLINE_LINUX_DEFAULT="quiet",g' /etc/default/grub
-echo > /etc/hostname $hostname
-cat > /etc/hosts << END
-127.0.0.1       localhost
-127.0.1.1       $hostname
-END
-
-cat > /etc/network/interfaces << END
-source /etc/network/interfaces.d/*
-
-# The loopback network interface
-auto lo
-iface lo inet loopback
-END
-
-cat /tmp/setup_chroot.sh
-/bin/sh -x /tmp/setup_chroot.sh
-
+#cat /tmp/import/setup_chroot.sh
+/bin/bash -x /tmp/import/setup_chroot.sh $dev $part
 set -x
-
-if [ -n "$locales" ]; then
-    for lc in $locales
-    do
-        sed -i "s,# \$lc ,\$lc ," /etc/locale.gen
-    done
-    locale-gen
+/bin/bash -x /tmp/import/post_install.sh
+if [ -n "$dev" ]; then
+  grub-install $dev --modules=part_msdos
+  update-grub
+  sed -i "s,$part,/dev/${cfg_disk_dev_name}1,g" /boot/grub/grub.cfg
 fi
-
-if [ ! -f /etc/default/keyboard ]; then
-    dpkg-reconfigure keyboard-configuration -f noninteractive
-    setupcon --save
-fi
-
-grub-install $dev --modules=part_msdos
-update-grub
-sed -i "s,$part,/dev/${disk_dev_name}1,g" /boot/grub/grub.cfg
-
-/bin/sh -x /tmp/post_install.sh
 
 apt clean
 EOF
@@ -439,16 +838,36 @@ get_image_type()
 {
     if [ ! -f "$1" ]; then
 	echo "Image do not exist: $1"
-	exit
+	exit 1
     fi
 
     if [ -n "$(file $1 | egrep -i 'qcow.*\(v3\)')" ]; then
-	image_format=qcow2
+	cfg_image_format=qcow2
     elif [ -n "$(file $1 | egrep -i 'qcow.*\(v1\)')" ]; then
-	image_format=qcow
+	cfg_image_format=qcow
     else
-	image_format=raw
+	cfg_image_format=raw
     fi
+}
+
+dhcp_delete_vm()
+{
+    local net=$1
+    local entry=$2
+    local t
+
+    case $entry in
+	*.*.*.*)
+	    t=$(virsh net-dumpxml $net|xpath 2>/dev/null -q -e "/network/ip/dhcp/host[@ip='$endtry']")
+	    [ -z "$t" ] || virsh 2>/dev/null net-update $net delete ip-dhcp-host  "<host ip='$entry'/>" --live
+	    [ -z "$t" ] || virsh 2>/dev/null net-update $net delete ip-dhcp-host  "<host ip='$entry'/>" --config
+	    ;;
+	*)
+	    t=$(virsh net-dumpxml $net|xpath 2>/dev/null -q -e "/network/ip/dhcp/host[@name='$entry']")
+	    [ -z "$t" ] || virsh 2>/dev/null net-update $net delete ip-dhcp-host  "<host name='$entry'/>" --live
+	    [ -z "$t" ] || virsh 2>/dev/null net-update $net delete ip-dhcp-host  "<host name='$entry'/>" --config
+	    ;;
+    esac
 }
 
 dhcp_add_vm()
@@ -461,24 +880,66 @@ dhcp_add_vm()
     local mac=$(virsh domiflist $name | awk "\$3 == \"$net\" { print \$5 }")
     if [ -z "$mac" ]; then
 	echo "VM ($name) not found"
-	exit
+	exit 1
     fi
 
-    t=$(virsh net-dumpxml $net|xpath 2>/dev/null -q -e "/network/ip/dhcp/host[@name='$name']")
-    [ -z "$t" ] || virsh 2>/dev/null net-update $net delete ip-dhcp-host  "<host name='$name'/>" --live
-    t=$(virsh net-dumpxml $net|xpath 2>/dev/null -q -e "/network/ip/dhcp/host[@ip='$ip']")
-    [ -z "$t" ] || virsh 2>/dev/null net-update $net delete ip-dhcp-host  "<host ip='$ip'/>" --live
-    virsh net-update $net add ip-dhcp-host  "<host mac='$mac' name='$name' ip='$ip'/>" --live
+    dhcp_delete_vm $net $name
+    dhcp_delete_vm $net $ip
+    virsh net-update $net add ip-dhcp-host  "<host mac='$mac' name='$name' ip='$ip'/>" --live --config
+}
+
+dhcp_show()
+{
+    local net=$1
+    virsh net-dumpxml $net|xpath 2>/dev/null -q -e "/network/ip/dhcp/host"
+}
+
+dhcp_lease()
+{
+    local net=$1
+    virsh net-dhcp-leases $net
 }
 
 do_image_visit()
 {
+    local c t
+    image=$1
+    shift
     get_image_type $image
-    attach_image $image_format $image
+    attach_image $cfg_image_format $image
     mnt=$(mktemp -d)
     mount_image $dev p1 $mnt
     mount_chroot $mnt
-    LANG=C sudo chroot $mnt /bin/bash
+    if [ -n "$1" ]; then
+	if [ ! -f "$1" ]; then
+	    echo "Command not found: $1"
+	    exit 1
+	fi
+	#echo > $mnt/tmp/import/visit.sh $1
+	cp $1 $mnt/tmp/import/visit.sh
+	chmod +x $mnt/tmp/import/visit.sh
+	c="/tmp/import/visit.sh"
+	shift 1
+	for t in "$@"; do
+	    shift
+	    if [ -d "$t" ]; then
+		cp -r "$t" $mnt/tmp/import/
+	    elif [ "$t" == "--" ]; then
+		c="$c $@"
+		break
+	    else
+		echo "Not a directory: $t"
+		exit 1
+	    fi
+	done
+    fi
+
+    if [ -n "$c" ]; then
+	LANG=C sudo chroot $mnt /bin/bash -c "$c"
+    else
+	LANG=C sudo chroot $mnt /bin/bash
+    fi
+
     umount_chroot $mnt
     detach_image $dev $dev_cmd
     exit
@@ -491,40 +952,44 @@ do_image_copy()
     exit
 }
 
+do_image_modify()
+{
+    image="$1"
+    shift
+    get_image_type "$image"
+    parse_img_args "$@"
+    CHROOT_SCRIPT=$(mktemp)
+    gen_chroot_script $CHROOT_SCRIPT
+    #cat $CHROOT_SCRIPT
+    do_image_visit "$image" $CHROOT_SCRIPT
+    rm $CHROOT_SCRIPT
+}
+
 do_vm_create()
 {
-    export vm_name=$1
-    export vm_networks=
-    export vm_disks=
-    export vm_console=
-    export vm_biosdevname=1
-    export vm_hostname=
-    export vm_locale=
-    export vm_cpus=1
-    export vm_mem=1024
-    export vm_dhcp=
+    read_vm_conf $1 $2
+    shift 2
+    parse_vm_args "$@"
 
-    def_vm_functions
-    . $setup_script
+    IFS=, read -r -a macs <<< "$cfg_macs"
+    read -r -a nets <<< "$vm_networks"
+    nopts=
 
-    # if [ "$vm_biosdevname" == "0" ]; then
-    # 	extra="$extra net.ifnames=0 biosdevname=0"
-    # fi
-    # if [ "$vm_console" == "serial" ]; then
-    # 	extra="$extra console=ttyS0,115200n8 serial"
-    # fi
-    # if [ -n "$vm_locale" ]; then
-    # 	extra="$extra locale=$vm_locale"
-    # fi
-    # if [ -n "$vm_hostname" ]; then
-    # 	extra="$extra hostname=$vm_hostname"
-    # fi
-    #--extra-args  "$extra" \
-    
+    for n in ${!nets[@]}
+    do
+	nopts="$nopts --network=network=${nets[$n]}"
+	if [ -n "${macs[$n]}" ]; then
+	    nopts="$nopts,mac=${macs[$n]}"
+	fi
+    done
+
+    [ -z "$vm_os_variant" ] || vm_os_variant="--os-variant $vm_os_variant"
+
     sudo virt-install -n "$vm_name" -r $vm_mem --vcpus $vm_cpus \
-	 $vm_networks \
+	 $nopts \
 	 --graphics vnc \
 	 --hvm --virt-type kvm \
+	 $vm_os_variant \
 	 $vm_disks \
 	 --noautoconsole \
 	 --import \
@@ -537,7 +1002,7 @@ do_vm_create()
 	ip=${t#*:}
 	if [ -z "$net" -o -z "$ip" ]; then
 	    echo "Invalid DHCP configuration: $vm_dhcp"
-	    exit
+	    exit 1
 	fi
 
 	dhcp_add_vm $net $vm_name $ip
@@ -546,6 +1011,8 @@ do_vm_create()
 
 do_vm()
 {
+    check_dependencies vm
+
     if [ "$1" == "create" ]; then
 	[[ $# -ge 3 ]] || usage
 	name=$2
@@ -559,17 +1026,135 @@ do_vm()
 	esac		    
 	if [ ! -f $setup_script ]; then
 	    echo "Setup script do not exist: $setup_script"
-	    exit
+	    exit 1
 	fi
-	do_vm_create $name
+	shift 3
+	do_vm_create $name $setup_script "$@"
+    elif [ "$1" == "dhcp" ]; then
+	:
     fi
 }
+
+network_restart()
+{
+    local net=$1 br
+
+    active=$(virsh net-info $net | grep Active: | awk '{print $2}')
+    br=$(virsh net-info $net | grep Bridge: | awk '{print $2}')
+
+    [ "$active" == "yes" ] && (virsh net-destroy $net || exit)
+
+    sudo rm -f /var/lib/libvirt/dnsmasq/${br}.status
+
+    virsh net-start $net || exit
+
+    network_repair "$net"
+}
+
+network_repair_the_virsh_way()
+{
+    local net=$1 m vms mac model
+
+    vms=$( virsh list | tail -n +3 | head -n -1 | awk '{ print $2; }' )
+
+    for m in $vms ; do
+	mac=$(virsh domiflist "$m"|egrep " network +$net +"|grep -o -E "([0-9a-f]{2}:){5}([0-9a-f]{2})")
+	[ -n "$mac" ] || continue
+	model=$(virsh domiflist "$m" | egrep "$mac" | awk '{ print $4 }')
+	[ -n "$model" ] || continue
+	echo $m $mac $model
+
+	virsh detach-interface "$m" network --mac "$mac" && sleep 1
+	virsh attach-interface "$m" network "$net" --mac "$mac" --model "$model"
+    done
+}
+
+network_repair_the_bridge_way()
+{
+    
+    local net=$1 bridge domains addcmd d i ifs
+
+    bridge=$(virsh net-info $net | grep Bridge: | awk '{print $2}')
+    [ -n "$bridge" ] || exit
+
+    domains=$(virsh list | tail -n +3 | awk '{print $2}')
+
+    if current=$(sudo ovs-vsctl list-ports $bridge 2>/dev/null); then
+	addcmd="sudo ovs-vsctl add-port"
+	type="bridge"
+    else
+	if ! brctl showmacs >/dev/null $bridge; then
+	    echo "Bridge not found: $bridge"
+	    exit 1
+	fi
+
+	current=$(brctl show $bridge | tail -n +2 | awk '{ print $(NF)}')
+	addcmd="sudo brctl addif"
+	type="network"
+    fi
+
+    if [ -n "$dry" ]; then
+	addcmd="echo $addcmd"
+    fi
+
+    for d in $domains
+    do
+	ifs=$(virsh domiflist $d| awk -v net=$net -v type=$type '$2==type && $3==net {print $1}')
+	for i in $ifs
+	do
+	    for c in $current
+	    do
+		[ "$c" == "$i" ] && continue 2
+	    done
+	    $addcmd $bridge $i
+	done
+    done
+}
+
+network_repair()
+{
+    network_repair_the_bridge_way "$@"
+}
+
+do_dhcp()
+{
+    local cmd=$1
+    shift 1
+    if [ "$cmd" == "add" ]; then
+	[[ $# -ge 3 ]] || usage
+	dhcp_add_vm "$@"
+    elif [ "$cmd" == "dhcp" ]; then
+	[[ $# -ge 2 ]] || usage
+	dhcp_delete_vm "$@"
+    elif [ "$cmd" == "show" ]; then
+	[[ $# -ge 1 ]] || usage
+	dhcp_show "$@"
+    elif [ "$cmd" == "lease" ]; then
+	[[ $# -ge 1 ]] || usage
+	dhcp_lease "$@"
+    fi
+}
+
+do_network()
+{
+    local cmd=$1
+    shift 1
+    if [ "$cmd" == "restart" ]; then
+	[[ $# -ge 1 ]] || usage
+	network_restart "$@"
+    elif [ "$cmd" == "repair" ]; then
+	[[ $# -ge 1 ]] || usage
+	network_repair "$@"
+    fi
+}
+
+trap clean_exit INT TERM EXIT
 
 cmd=$1
 shift 1
 
 case $cmd in
-    image|vm)
+    image|vm|dhcp|network)
 	do_$cmd "$@"
 	;;
     *)

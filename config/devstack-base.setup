@@ -1,0 +1,73 @@
+
+image_size 20
+image_format qcow2
+
+repo_url http://se.archive.ubuntu.com/ubuntu
+repo_release xenial
+
+include ssh git
+hostname devstack
+
+locales en_US.UTF-8
+
+network eth0 dhcp
+
+keyboard pc105 se
+
+timezone Europe/Stockholm
+
+console serial
+
+biosdevname 0
+
+ntp pool.ntp.org
+
+# Generate password with: openssl passwd -1
+useradd -m -p '$1$YnHXtgtC$62pEAJfRF/NqYdp5VlITC0' -s /bin/bash ubuntu
+gpasswd -a ubuntu sudo
+
+useradd -s /bin/bash -d /opt/stack -m stack
+gpasswd -a stack sudo
+
+%post
+
+cat > /etc/apt/sources.list << END
+deb http://se.archive.ubuntu.com/ubuntu xenial main restricted
+deb http://se.archive.ubuntu.com/ubuntu xenial-updates main restricted
+deb http://se.archive.ubuntu.com/ubuntu xenial universe
+deb http://se.archive.ubuntu.com/ubuntu xenial-updates universe
+deb http://se.archive.ubuntu.com/ubuntu xenial multiverse
+deb http://se.archive.ubuntu.com/ubuntu xenial-updates multiverse
+deb http://se.archive.ubuntu.com/ubuntu xenial-backports main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu xenial-security main restricted
+deb http://security.ubuntu.com/ubuntu xenial-security universe
+deb http://security.ubuntu.com/ubuntu xenial-security multiverse
+END
+
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade
+
+contains () {
+  local e match="$1"
+  shift
+  for e; do [[ "$e" == "$match" ]] && return 0; done
+  return 1
+}
+
+depends=$(dpkg -s linux-image-generic | grep Depends: | cut -d: -f2 | sed 's/,//g')
+remove=
+
+for p in $(dpkg -l "linux-image-*[0-9]*"|awk '/linux-image/ {print $2}')
+do
+    contains $p $depends || remove="$remove $p"
+done
+
+[ -z "$remove" ] || DEBIAN_FRONTEND=noninteractive apt remove -y --purge $remove
+
+dpkg -l "linux-image-*[0-9]*"
+
+DEBIAN_FRONTEND=noninteractive apt-get -y install crudini
+DEBIAN_FRONTEND=noninteractive apt-get -y install -f
+
+echo "ubuntu ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/ubuntu
+echo "stack ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/stack

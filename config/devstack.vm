@@ -1,0 +1,10 @@
+
+locale en_US
+
+os_variant ubuntu16.04
+
+hostname devstack
+
+memory 2G
+
+cpus 1

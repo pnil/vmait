@@ -1,15 +1,18 @@
-#!/bin/bash
 
-image_size=2
-image_format=qcow2
+# comment
+    # another comment
 
-ubuntu_url=http://se.archive.ubuntu.com/ubuntu
-ubuntu_release=xenial
+image_size 2
+image_format qcow2
 
-debootstrap_include=ssh
-hostname=test1
+repo_url http://se.archive.ubuntu.com/ubuntu
+repo_release xenial
 
-locales=en_US.UTF-8
+include ssh
+
+hostname test1
+
+locales en_US.UTF-8
 
 network eth0 dhcp
 
@@ -19,5 +22,5 @@ console serial
 
 biosdevname 0
 
-useradd -m -p '$1$ZHfsFWzb$Le8OieS9/wk6s/hO0JmNX.' -s /bin/bash denali
+useradd -m -c 'Team Denali' -p '$1$ZHfsFWzb$Le8OieS9/wk6s/hO0JmNX.' -s /bin/bash denali
 gpasswd -a denali sudo

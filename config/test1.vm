@@ -4,7 +4,7 @@ locale en_US
 network nat_ecn 192.168.120.177
 network packstack_bgci
 
-disk test1.img
+disk images/test1.img
 
 hostname test1
 
